@@ -208,6 +208,187 @@ def kelly_fraction(win_probability: float, american_odds: Any) -> Optional[float
 
 
 # -----------------------------
+# Reliability / alpha quality helpers
+# -----------------------------
+
+def calculate_blended_ev_percent(row: pd.Series, predictive_weight: float = 0.65) -> float:
+    """
+    Blends predictive EV with market EV so the model does not blindly override the market.
+
+    If predictive EV exists:
+        blended EV = predictive_weight * predictive EV + market_weight * market EV
+
+    If predictive EV does not exist:
+        blended EV = market EV
+    """
+    market_ev = safe_float(row.get("market_ev_percent"))
+    predictive_ev = safe_float(row.get("predictive_ev_percent"))
+
+    if predictive_ev is None:
+        return market_ev if market_ev is not None else 0.0
+
+    if market_ev is None:
+        return predictive_ev
+
+    market_weight = 1 - predictive_weight
+    return (predictive_weight * predictive_ev) + (market_weight * market_ev)
+
+
+def calculate_blended_probability(row: pd.Series, predictive_weight: float = 0.65) -> Optional[float]:
+    """
+    Conservative probability used for sizing.
+
+    This keeps Kelly sizing from using a pure predictive probability when the market disagrees.
+    """
+    market_probability = safe_float(row.get("fair_probability"))
+    predictive_probability = safe_float(row.get("predictive_probability"))
+
+    if predictive_probability is None:
+        return market_probability
+
+    if market_probability is None:
+        return predictive_probability
+
+    market_weight = 1 - predictive_weight
+    blended = (predictive_weight * predictive_probability) + (market_weight * market_probability)
+
+    return max(0.0001, min(0.9999, blended))
+
+
+def build_warning_flags(row: pd.Series) -> str:
+    flags = []
+
+    market_ev = safe_float(row.get("market_ev_percent"))
+    predictive_ev = safe_float(row.get("predictive_ev_percent"))
+    reference_count = safe_float(row.get("reference_book_count"))
+    market_edge = safe_float(row.get("market_edge_probability_points"))
+
+    if reference_count is not None and reference_count < 3:
+        flags.append("low reference count")
+
+    if market_ev is not None and market_ev < -7.5:
+        flags.append("market strongly disagrees")
+
+    if market_ev is not None and market_ev < -15:
+        flags.append("high negative market EV")
+
+    if market_edge is not None and market_edge < -5:
+        flags.append("negative market edge")
+
+    if market_ev is not None and predictive_ev is not None:
+        disagreement = abs(predictive_ev - market_ev)
+
+        if disagreement >= 20:
+            flags.append("extreme model/market gap")
+        elif disagreement >= 15:
+            flags.append("large model/market gap")
+
+    if predictive_ev is None:
+        flags.append("market EV only")
+
+    return ", ".join(flags)
+
+
+def assign_bet_tier(row: pd.Series) -> str:
+    blended_ev = safe_float(row.get("blended_ev_percent"))
+    market_ev = safe_float(row.get("market_ev_percent"))
+    predictive_ev = safe_float(row.get("predictive_ev_percent"))
+    reference_count = safe_float(row.get("reference_book_count"))
+
+    blended_ev = blended_ev if blended_ev is not None else 0.0
+    market_ev = market_ev if market_ev is not None else 0.0
+    reference_count = reference_count if reference_count is not None else 0
+
+    has_predictive = predictive_ev is not None
+
+    # Model likes it, but the broader market strongly disagrees.
+    if has_predictive and predictive_ev > 0 and market_ev < -7.5:
+        return "Review Only"
+
+    # Best case: predictive edge with reasonable market confirmation.
+    if has_predictive:
+        if blended_ev >= 2.0 and market_ev >= -2.5 and reference_count >= 4:
+            return "Strong Bet"
+
+        if blended_ev >= 1.0 and market_ev >= -7.5 and reference_count >= 3:
+            return "Model Lean"
+
+    # Non-predictive markets can still be useful market EV opportunities.
+    if not has_predictive:
+        if market_ev >= 1.0 and reference_count >= 3:
+            return "Market EV Bet"
+
+    return "Avoid"
+
+
+def calculate_bet_quality_score(row: pd.Series) -> float:
+    blended_ev = safe_float(row.get("blended_ev_percent")) or 0.0
+    market_ev = safe_float(row.get("market_ev_percent")) or 0.0
+    predictive_ev = safe_float(row.get("predictive_ev_percent"))
+    reference_count = safe_float(row.get("reference_book_count")) or 0
+    bet_tier = row.get("bet_tier", "Avoid")
+
+    score = 50.0
+
+    # Reward blended EV, but cap impact so one huge model output cannot dominate.
+    score += min(max(blended_ev * 3.0, -30), 30)
+
+    # Reward or punish market confirmation.
+    if market_ev >= 2:
+        score += min(market_ev * 2.0, 18)
+    elif market_ev >= 0:
+        score += 10
+    elif market_ev >= -2.5:
+        score += 5
+    elif market_ev < -15:
+        score -= 35
+    elif market_ev < -7.5:
+        score -= 20
+
+    # Reward reference market depth.
+    score += min(reference_count * 2.0, 12)
+
+    # Reward model/market agreement. Punish major disagreement.
+    if predictive_ev is not None:
+        disagreement = abs(predictive_ev - market_ev)
+
+        if disagreement <= 5:
+            score += 10
+        elif disagreement <= 10:
+            score += 4
+        elif disagreement >= 20:
+            score -= 20
+        elif disagreement >= 15:
+            score -= 12
+
+    # Tier-specific adjustment.
+    if bet_tier == "Strong Bet":
+        score += 10
+    elif bet_tier == "Market EV Bet":
+        score += 6
+    elif bet_tier == "Model Lean":
+        score += 2
+    elif bet_tier == "Review Only":
+        score -= 12
+    elif bet_tier == "Avoid":
+        score -= 30
+
+    return round(max(0, min(100, score)), 1)
+
+
+def get_tier_rank(tier: str) -> int:
+    tier_rank = {
+        "Strong Bet": 1,
+        "Market EV Bet": 2,
+        "Model Lean": 3,
+        "Review Only": 4,
+        "Avoid": 5,
+    }
+
+    return tier_rank.get(tier, 9)
+
+
+# -----------------------------
 # API fetchers
 # -----------------------------
 
@@ -961,21 +1142,39 @@ def calculate_ev_opportunities(
             merged.at[idx, "model_total_lambda"] = round(model["total_lambda"], 3)
             merged.at[idx, "model_total_line"] = model["total_line"]
 
-    # Alpha score favors predictive EV when available, otherwise normal market EV.
-    merged["alpha_ev_percent"] = merged["predictive_ev_percent"].where(
-        merged["predictive_ev_percent"].notna(),
-        merged["market_ev_percent"],
+    # Reliability layer:
+    # Alpha EV now uses blended EV rather than raw predictive EV.
+    # This keeps predictive signals useful while penalizing bets the market strongly disagrees with.
+    merged["blended_ev_percent"] = merged.apply(
+        lambda row: calculate_blended_ev_percent(row, predictive_weight=0.65),
+        axis=1,
     )
 
-    merged["alpha_probability"] = merged["predictive_probability"].where(
-        merged["predictive_probability"].notna(),
+    merged["blended_probability"] = merged.apply(
+        lambda row: calculate_blended_probability(row, predictive_weight=0.65),
+        axis=1,
+    )
+
+    merged["blended_fair_american_odds"] = merged["blended_probability"].apply(
+        probability_to_american
+    )
+
+    merged["alpha_ev_percent"] = merged["blended_ev_percent"]
+
+    merged["alpha_probability"] = merged["blended_probability"].where(
+        merged["blended_probability"].notna(),
         merged["fair_probability"],
     )
 
-    merged["alpha_fair_american_odds"] = merged["predictive_fair_american_odds"].where(
-        merged["predictive_fair_american_odds"].notna(),
+    merged["alpha_fair_american_odds"] = merged["blended_fair_american_odds"].where(
+        merged["blended_fair_american_odds"].notna(),
         merged["fair_american_odds"],
     )
+
+    merged["warning_flags"] = merged.apply(build_warning_flags, axis=1)
+    merged["bet_tier"] = merged.apply(assign_bet_tier, axis=1)
+    merged["bet_quality_score"] = merged.apply(calculate_bet_quality_score, axis=1)
+    merged["tier_rank"] = merged["bet_tier"].apply(get_tier_rank)
 
     merged["kelly_fraction"] = merged.apply(
         lambda row: kelly_fraction(row["alpha_probability"], row["price"]),
@@ -986,9 +1185,12 @@ def calculate_ev_opportunities(
         bankroll * merged["kelly_fraction"].fillna(0) * kelly_multiplier
     ).clip(lower=0)
 
+    # Default filter keeps the app actionable while still allowing Review Only rows.
+    # Avoid rows are dropped because they fail the reliability layer.
     merged = merged[
         merged["alpha_ev_percent"].notna()
         & (merged["alpha_ev_percent"] >= min_ev_percent)
+        & (merged["bet_tier"] != "Avoid")
     ].copy()
 
     merged["commence_time"] = pd.to_datetime(
@@ -998,8 +1200,8 @@ def calculate_ev_opportunities(
     )
 
     merged = merged.sort_values(
-        by=["alpha_ev_percent", "market_ev_percent"],
-        ascending=False,
+        by=["tier_rank", "bet_quality_score", "alpha_ev_percent", "market_ev_percent"],
+        ascending=[True, False, False, False],
     )
 
     cols = [
@@ -1027,9 +1229,16 @@ def calculate_ev_opportunities(
         "push_probability",
         "predictive_ev_percent",
         "predictive_fair_american_odds",
+        "blended_ev_percent",
+        "blended_probability",
+        "blended_fair_american_odds",
         "alpha_ev_percent",
         "alpha_probability",
         "alpha_fair_american_odds",
+        "bet_quality_score",
+        "bet_tier",
+        "warning_flags",
+        "tier_rank",
         "reference_book_count",
         "suggested_bet_size",
         "model_type",
@@ -1252,6 +1461,7 @@ def format_opportunities_for_display(df: pd.DataFrame) -> pd.DataFrame:
     out["Odds"] = out["price"].apply(format_american)
     out["Market Fair Odds"] = out["fair_american_odds"].apply(format_american)
     out["Predictive Fair Odds"] = out["predictive_fair_american_odds"].apply(format_american)
+    out["Blended Fair Odds"] = out["blended_fair_american_odds"].apply(format_american)
     out["Alpha Fair Odds"] = out["alpha_fair_american_odds"].apply(format_american)
 
     out["Market EV %"] = out["market_ev_percent"].apply(
@@ -1259,6 +1469,10 @@ def format_opportunities_for_display(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     out["Predictive EV %"] = out["predictive_ev_percent"].apply(
+        lambda x: "—" if pd.isna(x) else f"{x:.2f}%"
+    )
+
+    out["Blended EV %"] = out["blended_ev_percent"].apply(
         lambda x: "—" if pd.isna(x) else f"{x:.2f}%"
     )
 
@@ -1282,8 +1496,19 @@ def format_opportunities_for_display(df: pd.DataFrame) -> pd.DataFrame:
         lambda x: "—" if pd.isna(x) else f"{x:.2%}"
     )
 
+    out["Blended Prob"] = out["blended_probability"].apply(
+        lambda x: "—" if pd.isna(x) else f"{x:.2%}"
+    )
+
+    out["Quality Score"] = out["bet_quality_score"].apply(
+        lambda x: "—" if pd.isna(x) else f"{x:.1f}/100"
+    )
+
     cols = [
+        "bet_tier",
+        "Quality Score",
         "Alpha EV %",
+        "Blended EV %",
         "Predictive EV %",
         "Market EV %",
         "Suggested Bet",
@@ -1291,11 +1516,14 @@ def format_opportunities_for_display(df: pd.DataFrame) -> pd.DataFrame:
         "Bet",
         "Odds",
         "Alpha Fair Odds",
+        "Blended Fair Odds",
         "Market Fair Odds",
         "Predictive Fair Odds",
         "Market Edge",
         "Market Fair Prob",
         "Predictive Prob",
+        "Blended Prob",
+        "warning_flags",
         "sport",
         "Start Time",
         "game",
