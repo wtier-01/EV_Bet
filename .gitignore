@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+venv/
+.env
+.env.*
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Data/cache files
+data/cache/
+*.csv
+*.json
+
+# Mac
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
