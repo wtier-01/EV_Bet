@@ -103,15 +103,53 @@ CUSTOM_CSS = """
     margin-left: 6px;
 }
 
+.badge-strong {
+    background: rgba(0, 180, 90, 0.14);
+    color: #00a65a;
+}
+
+.badge-market {
+    background: rgba(0, 123, 255, 0.12);
+    color: #007bff;
+}
+
+.badge-model {
+    background: rgba(138, 43, 226, 0.12);
+    color: #8a2be2;
+}
+
+.badge-review {
+    background: rgba(255, 193, 7, 0.18);
+    color: #c78a00;
+}
+
+.badge-signal {
+    background: rgba(255, 75, 75, 0.12);
+    color: #ff4b4b;
+}
+
 .subtle-divider {
     height: 1px;
     background: rgba(49, 51, 63, 0.12);
     margin: 8px 0;
 }
+
+.warning-text {
+    color: #c78a00;
+    font-weight: 700;
+}
 </style>
 """
 
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+
+BET_TIER_OPTIONS = [
+    "Strong Bet",
+    "Market EV Bet",
+    "Model Lean",
+    "Review Only",
+]
 
 
 def init_state():
@@ -227,8 +265,8 @@ def sidebar_controls():
         value=1.0,
         step=0.25,
         help=(
-            "Filters on Alpha EV. Alpha EV uses Predictive EV when available, "
-            "otherwise it uses Market EV."
+            "Filters on Alpha EV. Alpha EV now uses Blended EV, which combines "
+            "Predictive EV with Market EV confirmation."
         ),
     )
 
@@ -236,7 +274,7 @@ def sidebar_controls():
         "Minimum Reference Books",
         min_value=1,
         max_value=10,
-        value=2,
+        value=3,
         step=1,
         help="Higher is cleaner but may reduce the number of opportunities.",
     )
@@ -263,6 +301,29 @@ def sidebar_controls():
         ),
     )
 
+    st.sidebar.divider()
+
+    st.sidebar.subheader("Reliability Filters")
+
+    allowed_tiers = st.sidebar.multiselect(
+        "Show Bet Tiers",
+        options=BET_TIER_OPTIONS,
+        default=["Strong Bet", "Market EV Bet", "Model Lean"],
+        help=(
+            "Review Only rows are hidden by default because the model likes them but "
+            "the broader market strongly disagrees."
+        ),
+    )
+
+    min_quality_score = st.sidebar.slider(
+        "Minimum Quality Score",
+        min_value=0,
+        max_value=100,
+        value=50,
+        step=5,
+        help="Higher is stricter. Start around 50, then raise if too many weak bets appear.",
+    )
+
     regions = st.sidebar.selectbox(
         "Region",
         options=["us", "us2", "uk", "eu", "au"],
@@ -283,6 +344,8 @@ def sidebar_controls():
         "bankroll": bankroll,
         "kelly_multiplier": kelly_multiplier,
         "include_predictive_ev": include_predictive_ev,
+        "allowed_tiers": allowed_tiers,
+        "min_quality_score": min_quality_score,
         "regions": regions,
     }
 
@@ -328,7 +391,7 @@ def main():
 
     st.markdown('<div class="big-title">EV Bet Dashboard</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="subtitle">Full-market EV and predictive alpha scanner for your sportsbooks.</div>',
+        '<div class="subtitle">Full-market EV, predictive alpha, blended EV, and reliability scoring.</div>',
         unsafe_allow_html=True,
     )
 
@@ -387,6 +450,8 @@ def main():
                     include_predictive_ev=controls["include_predictive_ev"],
                 )
 
+                ev_results = apply_dashboard_filters(ev_results, controls)
+
                 st.session_state.raw_odds = raw_odds
                 st.session_state.ev_results = ev_results
                 st.session_state.quota_log = quota_log
@@ -397,6 +462,46 @@ def main():
                 st.error(str(exc))
 
     render_dashboard()
+
+
+def apply_dashboard_filters(ev_results: pd.DataFrame, controls: dict) -> pd.DataFrame:
+    if ev_results.empty:
+        return ev_results
+
+    filtered = ev_results.copy()
+
+    if "bet_tier" in filtered.columns and controls.get("allowed_tiers"):
+        filtered = filtered[
+            filtered["bet_tier"].isin(controls["allowed_tiers"])
+        ].copy()
+
+    if "bet_quality_score" in filtered.columns:
+        filtered = filtered[
+            filtered["bet_quality_score"].fillna(0) >= controls["min_quality_score"]
+        ].copy()
+
+    sort_columns = []
+    ascending = []
+
+    if "tier_rank" in filtered.columns:
+        sort_columns.append("tier_rank")
+        ascending.append(True)
+
+    if "bet_quality_score" in filtered.columns:
+        sort_columns.append("bet_quality_score")
+        ascending.append(False)
+
+    if "alpha_ev_percent" in filtered.columns:
+        sort_columns.append("alpha_ev_percent")
+        ascending.append(False)
+
+    if sort_columns:
+        filtered = filtered.sort_values(
+            by=sort_columns,
+            ascending=ascending,
+        ).reset_index(drop=True)
+
+    return filtered
 
 
 def render_dashboard():
@@ -422,7 +527,7 @@ def render_dashboard():
         st.metric("Raw Odds Rows", f"{len(raw_odds):,}")
 
     with metric_2:
-        st.metric("EV Opportunities", f"{len(ev_results):,}")
+        st.metric("Displayed Bets", f"{len(ev_results):,}")
 
     with metric_3:
         if not ev_results.empty and "alpha_ev_percent" in ev_results.columns:
@@ -431,10 +536,12 @@ def render_dashboard():
             st.metric("Best Alpha EV", "—")
 
     with metric_4:
-        if not ev_results.empty and "alpha_ev_percent" in ev_results.columns:
-            st.metric("Avg Alpha EV", f"{ev_results['alpha_ev_percent'].mean():.2f}%")
+        if not ev_results.empty and "bet_quality_score" in ev_results.columns:
+            st.metric("Best Quality", f"{ev_results['bet_quality_score'].max():.1f}/100")
         else:
-            st.metric("Avg Alpha EV", "—")
+            st.metric("Best Quality", "—")
+
+    render_tier_metrics(ev_results)
 
     st.divider()
 
@@ -464,13 +571,34 @@ def render_dashboard():
         render_explanation()
 
 
+def render_tier_metrics(ev_results: pd.DataFrame):
+    if ev_results.empty or "bet_tier" not in ev_results.columns:
+        return
+
+    counts = ev_results["bet_tier"].value_counts().to_dict()
+
+    col_1, col_2, col_3, col_4 = st.columns(4)
+
+    with col_1:
+        st.metric("Strong Bets", counts.get("Strong Bet", 0))
+
+    with col_2:
+        st.metric("Market EV Bets", counts.get("Market EV Bet", 0))
+
+    with col_3:
+        st.metric("Model Leans", counts.get("Model Lean", 0))
+
+    with col_4:
+        st.metric("Review Only", counts.get("Review Only", 0))
+
+
 def render_best_bets(ev_results: pd.DataFrame):
     st.subheader("Best Bets to Place")
 
     if ev_results.empty:
         st.info(
-            "No EV opportunities found with your current filters. Try lowering Minimum Alpha EV %, "
-            "lowering Minimum Reference Books, adding more reference books, or checking whether the selected sport has active markets."
+            "No bets passed the current filters. Try lowering Minimum Alpha EV %, "
+            "lowering Minimum Quality Score, allowing Model Lean, or lowering Minimum Reference Books."
         )
         return
 
@@ -482,15 +610,11 @@ def render_best_bets(ev_results: pd.DataFrame):
         step=5,
     )
 
-    sort_col = "alpha_ev_percent" if "alpha_ev_percent" in ev_results.columns else None
-
-    if sort_col:
-        top = ev_results.sort_values(by=sort_col, ascending=False).head(top_n).copy()
-    else:
-        top = ev_results.head(top_n).copy()
+    top = get_sorted_bets(ev_results).head(top_n).copy()
 
     for _, row in top.iterrows():
         alpha_ev = get_number(row, "alpha_ev_percent", 0.0)
+        blended_ev = get_number(row, "blended_ev_percent", None)
         market_ev = get_number(row, "market_ev_percent", None)
         predictive_ev = get_number(row, "predictive_ev_percent", None)
 
@@ -503,6 +627,7 @@ def render_best_bets(ev_results: pd.DataFrame):
         price = row.get("price", row.get("odds_american", None))
 
         alpha_fair_odds = row.get("alpha_fair_american_odds", None)
+        blended_fair_odds = row.get("blended_fair_american_odds", None)
         market_fair_odds = row.get("fair_american_odds", None)
         predictive_fair_odds = row.get("predictive_fair_american_odds", None)
 
@@ -510,26 +635,38 @@ def render_best_bets(ev_results: pd.DataFrame):
         market_edge = get_number(row, "market_edge_probability_points", None)
 
         alpha_probability = get_number(row, "alpha_probability", None)
+        blended_probability = get_number(row, "blended_probability", None)
         market_probability = get_number(row, "fair_probability", None)
         predictive_probability = get_number(row, "predictive_probability", None)
         push_probability = get_number(row, "push_probability", None)
 
         model_type = row.get("model_type", None)
+        bet_tier = row.get("bet_tier", "—")
+        quality_score = get_number(row, "bet_quality_score", None)
+        warning_flags = row.get("warning_flags", "")
 
         bet_text = build_readable_bet(market, selection, description, point)
 
         odds_text = format_american(price)
         alpha_fair_text = format_american(alpha_fair_odds)
+        blended_fair_text = format_american(blended_fair_odds)
         market_fair_text = format_american(market_fair_odds)
         predictive_fair_text = format_american(predictive_fair_odds)
 
+        alpha_ev_text = format_percent(alpha_ev)
+        blended_ev_text = format_percent(blended_ev)
         market_ev_text = format_percent(market_ev)
         predictive_ev_text = format_percent(predictive_ev)
+
         alpha_probability_text = format_probability(alpha_probability)
+        blended_probability_text = format_probability(blended_probability)
         market_probability_text = format_probability(market_probability)
         predictive_probability_text = format_probability(predictive_probability)
         push_probability_text = format_probability(push_probability)
+
+        quality_text = "—" if quality_score is None else f"{quality_score:.1f}/100"
         market_edge_text = "—" if market_edge is None else f"{market_edge:.2f} pts"
+        warning_text = warning_flags if is_valid_value(warning_flags) else "none"
 
         if is_valid_value(model_type):
             signal_text = f"Predictive model: {model_type}"
@@ -538,7 +675,9 @@ def render_best_bets(ev_results: pd.DataFrame):
             signal_text = "Signal: full-market no-vig consensus"
             signal_badge = "Market"
 
-        col1, col2, col3 = st.columns([4.5, 1.35, 1.35])
+        tier_badge_class = get_tier_badge_class(bet_tier)
+
+        col1, col2, col3 = st.columns([4.7, 1.25, 1.25])
 
         with col1:
             st.markdown(
@@ -546,21 +685,28 @@ def render_best_bets(ev_results: pd.DataFrame):
                 <div class="bet-card">
                     <div class="bet-title">
                         {book} — {bet_text}
-                        <span class="badge">{signal_badge}</span>
+                        <span class="badge {tier_badge_class}">{bet_tier}</span>
+                        <span class="badge badge-signal">{signal_badge}</span>
                     </div>
                     <div class="bet-meta">{game}</div>
                     <div class="subtle-divider"></div>
                     <div class="bet-meta">
-                        Odds: <b>{odds_text}</b> | Alpha Fair Odds: <b>{alpha_fair_text}</b>
+                        Odds: <b>{odds_text}</b> | Alpha Fair Odds: <b>{alpha_fair_text}</b> | Blended Fair Odds: <b>{blended_fair_text}</b>
                     </div>
                     <div class="bet-meta">
-                        Market EV: <b>{market_ev_text}</b> | Predictive EV: <b>{predictive_ev_text}</b>
+                        Alpha EV: <b>{alpha_ev_text}</b> | Blended EV: <b>{blended_ev_text}</b> | Market EV: <b>{market_ev_text}</b> | Predictive EV: <b>{predictive_ev_text}</b>
                     </div>
                     <div class="bet-meta">
                         Market Fair: <b>{market_fair_text}</b> | Predictive Fair: <b>{predictive_fair_text}</b>
                     </div>
                     <div class="bet-meta">
-                        Alpha Prob: <b>{alpha_probability_text}</b> | Market Prob: <b>{market_probability_text}</b> | Predictive Prob: <b>{predictive_probability_text}</b> | Push: <b>{push_probability_text}</b>
+                        Alpha Prob: <b>{alpha_probability_text}</b> | Blended Prob: <b>{blended_probability_text}</b> | Market Prob: <b>{market_probability_text}</b> | Predictive Prob: <b>{predictive_probability_text}</b> | Push: <b>{push_probability_text}</b>
+                    </div>
+                    <div class="bet-meta">
+                        Quality: <b>{quality_text}</b> | Market Edge: <b>{market_edge_text}</b>
+                    </div>
+                    <div class="bet-meta">
+                        Warnings: <span class="warning-text">{warning_text}</span>
                     </div>
                     <div class="bet-meta">{signal_text}</div>
                 </div>
@@ -574,7 +720,7 @@ def render_best_bets(ev_results: pd.DataFrame):
                 f'<div class="ev-positive">{alpha_ev:.2f}%</div>',
                 unsafe_allow_html=True,
             )
-            st.caption(f"Market edge: {market_edge_text}")
+            st.caption(f"Quality: {quality_text}")
 
         with col3:
             st.markdown('<div class="small-label">Suggested</div>', unsafe_allow_html=True)
@@ -583,6 +729,36 @@ def render_best_bets(ev_results: pd.DataFrame):
                 unsafe_allow_html=True,
             )
             st.caption(f"Odds: {odds_text}")
+
+
+def get_sorted_bets(ev_results: pd.DataFrame) -> pd.DataFrame:
+    if ev_results.empty:
+        return ev_results
+
+    sorted_df = ev_results.copy()
+
+    sort_columns = []
+    ascending = []
+
+    if "tier_rank" in sorted_df.columns:
+        sort_columns.append("tier_rank")
+        ascending.append(True)
+
+    if "bet_quality_score" in sorted_df.columns:
+        sort_columns.append("bet_quality_score")
+        ascending.append(False)
+
+    if "alpha_ev_percent" in sorted_df.columns:
+        sort_columns.append("alpha_ev_percent")
+        ascending.append(False)
+
+    if sort_columns:
+        return sorted_df.sort_values(
+            by=sort_columns,
+            ascending=ascending,
+        ).reset_index(drop=True)
+
+    return sorted_df
 
 
 def render_full_table(ev_results: pd.DataFrame):
@@ -643,7 +819,7 @@ def render_explanation():
 
     st.markdown(
         """
-        This dashboard now separates **Market EV**, **Predictive EV**, and **Alpha EV**.
+        This dashboard separates **Market EV**, **Predictive EV**, **Blended EV**, and **Alpha EV**.
 
         ### 1. Market EV
 
@@ -661,7 +837,7 @@ def render_explanation():
 
         ### 2. Predictive EV
 
-        Predictive EV is the alpha layer.
+        Predictive EV is the model layer.
 
         For MLB core markets, the app uses a market-calibrated Poisson model:
 
@@ -679,25 +855,46 @@ def render_explanation():
 
         Other sports and player props still use Market EV until predictive models are added for them.
 
-        ### 3. Alpha EV
+        ### 3. Blended EV
 
-        Alpha EV is the main ranking column.
+        Blended EV is the reliability layer.
 
-        The rule is:
+        Instead of blindly using Predictive EV, the app blends model signal with market confirmation:
 
-        `Alpha EV = Predictive EV when available, otherwise Market EV`
+        `Blended EV = 65% Predictive EV + 35% Market EV`
 
-        So the Best Bets tab ranks by the strongest available signal.
+        When Predictive EV is unavailable:
 
-        ### 4. Suggested bet sizing
+        `Blended EV = Market EV`
 
-        Suggested sizing uses fractional Kelly.
+        This helps downgrade bets where the model likes the play but the broader market strongly disagrees.
+
+        ### 4. Alpha EV
+
+        Alpha EV is now the main ranking column and equals Blended EV.
+
+        So the Best Bets tab ranks by:
+
+        - Bet tier
+        - Quality score
+        - Alpha EV
+
+        ### 5. Bet tiers
+
+        - **Strong Bet**: best blend of model edge, market confirmation, and reference depth.
+        - **Market EV Bet**: no predictive model, but positive market-based EV.
+        - **Model Lean**: model likes it, but market confirmation is weaker.
+        - **Review Only**: model likes it, but the market strongly disagrees.
+
+        ### 6. Suggested bet sizing
+
+        Suggested sizing uses fractional Kelly based on Alpha Probability.
 
         Quarter Kelly is the default because full Kelly can be too aggressive.
 
         ### Important
 
-        This is not a guarantee of profit. It is a pricing and signal-discovery tool. The goal is to find bets where your available price appears better than either the full-market consensus or the predictive model.
+        This is not a guarantee of profit. It is a pricing and signal-discovery tool. The goal is to find bets where your available price appears better than either the full-market consensus or the predictive model, while filtering out the most fragile signals.
         """
     )
 
@@ -807,6 +1004,22 @@ def is_valid_value(value):
         return False
 
     return True
+
+
+def get_tier_badge_class(bet_tier):
+    if bet_tier == "Strong Bet":
+        return "badge-strong"
+
+    if bet_tier == "Market EV Bet":
+        return "badge-market"
+
+    if bet_tier == "Model Lean":
+        return "badge-model"
+
+    if bet_tier == "Review Only":
+        return "badge-review"
+
+    return "badge-signal"
 
 
 if __name__ == "__main__":
